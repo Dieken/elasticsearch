@@ -42,6 +42,9 @@ import org.elasticsearch.rest.action.support.RestBuilderListener;
 import static org.elasticsearch.rest.RestRequest.Method.POST;
 import static org.elasticsearch.rest.RestRequest.Method.PUT;
 import static org.elasticsearch.rest.RestStatus.OK;
+import static org.elasticsearch.rest.RestStatus.TOO_MANY_REQUESTS;
+
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * <pre>
@@ -55,6 +58,8 @@ import static org.elasticsearch.rest.RestStatus.OK;
 public class RestBulkAction extends BaseRestHandler {
 
     private final boolean allowExplicitIndex;
+    private final long maxInflightRequestsSize;
+    private final LongAdder inflightRequestsSize = new LongAdder();
 
     @Inject
     public RestBulkAction(Settings settings, RestController controller, Client client) {
@@ -68,10 +73,20 @@ public class RestBulkAction extends BaseRestHandler {
         controller.registerHandler(PUT, "/{index}/{type}/_bulk", this);
 
         this.allowExplicitIndex = settings.getAsBoolean("rest.action.multi.allow_explicit_index", true);
+        this.maxInflightRequestsSize = settings.getAsMemory("rest.action.bulk.max_inflight_requests_size", "200mb").bytes();
     }
 
     @Override
     public void handleRequest(final RestRequest request, final RestChannel channel, final Client client) throws Exception {
+        final long requestSize = request.content().length();    // rough estimation, ignore uri and headers
+        long numInflightRequestsSize = inflightRequestsSize.sum() + requestSize;
+        if (numInflightRequestsSize > maxInflightRequestsSize) {
+            String msg = numInflightRequestsSize + " bytes in-flight /_bulk requests exceed limit " + maxInflightRequestsSize;
+            channel.sendResponse(new BytesRestResponse(TOO_MANY_REQUESTS, msg));
+            logger.debug(msg);
+            return;
+        }
+
         BulkRequest bulkRequest = Requests.bulkRequest();
         String defaultIndex = request.param("index");
         String defaultType = request.param("type");
@@ -90,6 +105,8 @@ public class RestBulkAction extends BaseRestHandler {
         client.bulk(bulkRequest, new RestBuilderListener<BulkResponse>(channel) {
             @Override
             public RestResponse buildResponse(BulkResponse response, XContentBuilder builder) throws Exception {
+                inflightRequestsSize.add(-requestSize);
+
                 builder.startObject();
                 builder.field(Fields.TOOK, response.getTookInMillis());
                 builder.field(Fields.ERRORS, response.hasFailures());
@@ -150,6 +167,8 @@ public class RestBulkAction extends BaseRestHandler {
                 return new BytesRestResponse(OK, builder);
             }
         });
+
+        inflightRequestsSize.add(requestSize);
     }
 
     static final class Fields {
